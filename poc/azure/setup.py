@@ -12,8 +12,6 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
 
 LOCATION = "eastus"
@@ -25,8 +23,6 @@ VM_SIZE = "Standard_B1s"
 VM_IMAGE = "MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition:latest"
 ADMIN_USERNAME = "gns"
 ADMIN_PASSWORD = "SitaGns-123"
-DCR_NAME = "dcr-gns-poc-heartbeat"
-DCR_ASSOCIATION_NAME = "dcra-gns-poc-heartbeat"
 DATA_EXPORT_NAME = "export-heartbeat-to-eventhub"
 BLOB_CONTAINER = "checkpoints"
 
@@ -49,21 +45,31 @@ def main() -> None:
         raise SystemExit("Azure CLI is not installed or is not in PATH.")
 
     rg = args.resource_group
-    subscription_id = az("account", "show", "--query", "id", output="tsv")
-    storage_suffix = hashlib.sha256(f"{subscription_id}:{rg}".encode()).hexdigest()[:16]
+    storage_suffix = hashlib.sha256(rg.lower().encode()).hexdigest()[:16]
     storage_account = f"stgnspoc{storage_suffix}"
 
     az("group", "show", "--name", rg)
-    az("provider", "register", "--namespace", "Microsoft.Insights", "--wait")
 
     print("Creating Log Analytics workspace...")
-    law_id = az(
+    az(
         "monitor", "log-analytics", "workspace", "create",
         "--resource-group", rg,
         "--workspace-name", LAW_NAME,
         "--location", LOCATION,
         "--sku", "PerGB2018",
-        "--query", "id",
+    )
+    law_workspace_id = az(
+        "monitor", "log-analytics", "workspace", "show",
+        "--resource-group", rg,
+        "--workspace-name", LAW_NAME,
+        "--query", "customerId",
+        output="tsv",
+    )
+    law_workspace_key = az(
+        "monitor", "log-analytics", "workspace", "get-shared-keys",
+        "--resource-group", rg,
+        "--workspace-name", LAW_NAME,
+        "--query", "primarySharedKey",
         output="tsv",
     )
 
@@ -117,7 +123,7 @@ def main() -> None:
     )
 
     print("Creating Windows Server VM...")
-    vm_id = az(
+    az(
         "vm", "create",
         "--resource-group", rg,
         "--name", VM_NAME,
@@ -128,70 +134,17 @@ def main() -> None:
         "--admin-password", ADMIN_PASSWORD,
         "--security-type", "Standard",
         "--nsg-rule", "NONE",
-        "--query", "id",
-        output="tsv",
     )
 
     print("Connecting the VM to Log Analytics...")
-    az("vm", "identity", "assign", "--resource-group", rg, "--name", VM_NAME)
-    az("extension", "add", "--name", "monitor-control-service", "--upgrade")
-
-    dcr = {
-        "kind": "Windows",
-        "properties": {
-            "dataSources": {
-                "performanceCounters": [
-                    {
-                        "name": "minimalPerf",
-                        "streams": ["Microsoft-Perf"],
-                        "samplingFrequencyInSeconds": 60,
-                        "counterSpecifiers": [r"\Processor(_Total)\% Processor Time"],
-                    }
-                ]
-            },
-            "destinations": {
-                "logAnalytics": [
-                    {"name": "law", "workspaceResourceId": law_id}
-                ]
-            },
-            "dataFlows": [
-                {"streams": ["Microsoft-Perf"], "destinations": ["law"]}
-            ],
-        },
-    }
-
-    rule_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as rule_file:
-            json.dump(dcr, rule_file)
-            rule_path = Path(rule_file.name)
-
-        dcr_id = az(
-            "monitor", "data-collection", "rule", "create",
-            "--resource-group", rg,
-            "--name", DCR_NAME,
-            "--location", LOCATION,
-            "--kind", "Windows",
-            "--rule-file", str(rule_path),
-            "--query", "id",
-            output="tsv",
-        )
-    finally:
-        if rule_path:
-            rule_path.unlink(missing_ok=True)
-
     az(
         "vm", "extension", "set",
-        "--ids", vm_id,
-        "--name", "AzureMonitorWindowsAgent",
-        "--publisher", "Microsoft.Azure.Monitor",
-        "--enable-auto-upgrade", "true",
-    )
-    az(
-        "monitor", "data-collection", "rule", "association", "create",
-        "--name", DCR_ASSOCIATION_NAME,
-        "--rule-id", dcr_id,
-        "--resource", vm_id,
+        "--resource-group", rg,
+        "--vm-name", VM_NAME,
+        "--name", "MicrosoftMonitoringAgent",
+        "--publisher", "Microsoft.EnterpriseCloud.Monitoring",
+        "--settings", json.dumps({"workspaceId": law_workspace_id}),
+        "--protected-settings", json.dumps({"workspaceKey": law_workspace_key}),
     )
 
     print("Exporting new Heartbeat records from Log Analytics to Event Hub...")
